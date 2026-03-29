@@ -297,81 +297,188 @@ function drawFibreFish(dna, t) {
 }
 
 /* ═══════════════════════════════════════
-   FISH INSTANCES
+   FLOCKING GROUPS + FISH INSTANCES
 ═══════════════════════════════════════ */
-const tankFish = [];
+const tankFish  = [];
+const flocks    = []; // each flock: { id, members: [fish,...], wander, wSpd }
+let   flockIdCounter = 0;
 
-function spawnFish(dnaOverride) {
-  const seed = Math.floor(Math.random()*999999);
-  const rng  = mulberry32(seed);
-  const dna  = dnaOverride || generateFishDNA(rng);
+const FLOCK_MIN = 10;
+const FLOCK_MAX = 15;
 
-  /* Scale so the fish appears ~80-130px wide on screen */
+/* Flocking weights */
+const W_SEP      = 0.18;   // separation
+const W_ALI      = 0.10;   // alignment
+const W_COH      = 0.06;   // cohesion
+const W_FLOCK    = 0.04;   // steer toward flock centre
+const W_WANDER   = 0.003;  // individual wander
+const SPEED_TGT  = 0.55;
+const SEP_RADIUS = 55;      // px — avoid neighbours closer than this
+const FLOCK_R    = 260;     // px — see flock-mates within this radius
+
+function createFlock(cx, cy) {
+  const id     = flockIdCounter++;
+  const wander = Math.random() * Math.PI * 2;
+  const wSpd   = (Math.random() - 0.5) * 0.008;
+  const flock  = { id, members: [], wander, wSpd };
+  flocks.push(flock);
+  return flock;
+}
+
+function spawnFish(dnaOverride, flockRef, px, py) {
+  const seed   = Math.floor(Math.random()*999999);
+  const rng    = mulberry32(seed);
+  const dna    = dnaOverride || generateFishDNA(rng);
   const targetW = 80 + Math.random()*50;
   const scale   = targetW / dna.bodyLength;
 
-  /* Start inside the screen */
-  const x = TW*0.12 + Math.random()*TW*0.76;
-  const y = TH*0.12 + Math.random()*TH*0.76;
+  const x = px != null ? px : TW*0.12 + Math.random()*TW*0.76;
+  const y = py != null ? py : TH*0.12 + Math.random()*TH*0.76;
   const a = Math.random()*Math.PI*2;
-  const spd = 0.35 + Math.random()*0.4;
+  const spd = SPEED_TGT * (0.85 + Math.random()*0.3);
 
-  return {
+  const fish = {
     x, y,
     vx: Math.cos(a)*spd,
     vy: Math.sin(a)*spd,
     dna, scale,
-    t:       Math.random()*100,
-    wander:  Math.random()*Math.PI*2,
-    wSpd:    (Math.random()-0.5)*0.011,
-    opacity: 0,
+    t:        Math.random()*100,
+    wander:   Math.random()*Math.PI*2,
+    wSpd:     (Math.random()-0.5)*0.013,
+    opacity:  0,
+    flockId:  flockRef ? flockRef.id : -1,
   };
+
+  if (flockRef) flockRef.members.push(fish);
+  tankFish.push(fish);
+  return fish;
+}
+
+/* Assign a fish to the flock with room, or create a new one */
+function assignFlock(fish, nearX, nearY) {
+  /* Find a flock near spawn point that still has room */
+  let best = null, bestDist = Infinity;
+  for (const fl of flocks) {
+    if (fl.members.length >= FLOCK_MAX) continue;
+    const cx = fl.members.reduce((s,f)=>s+f.x,0)/fl.members.length;
+    const cy = fl.members.reduce((s,f)=>s+f.y,0)/fl.members.length;
+    const d  = Math.hypot(cx - nearX, cy - nearY);
+    if (d < bestDist) { bestDist = d; best = fl; }
+  }
+  if (!best || bestDist > 400) best = createFlock(nearX, nearY);
+  fish.flockId = best.id;
+  best.members.push(fish);
+}
+
+function updateFlock(fl) {
+  fl.wander += fl.wSpd;
+  /* Prune dead members */
+  fl.members = fl.members.filter(f => tankFish.includes(f));
 }
 
 function updateFish(f) {
   f.t += 0.015;
-  if (f.opacity < 1) f.opacity = Math.min(1, f.opacity+0.006);
+  if (f.opacity < 1) f.opacity = Math.min(1, f.opacity + 0.006);
 
+  /* Find my flock */
+  const myFlock = flocks.find(fl => fl.id === f.flockId);
+
+  /* ── Boid forces ── */
+  let sepX=0, sepY=0, aliX=0, aliY=0, cohX=0, cohY=0;
+  let sepN=0, aliN=0;
+
+  const mates = myFlock ? myFlock.members : [];
+  for (const o of mates) {
+    if (o === f) continue;
+    const dx = f.x - o.x, dy = f.y - o.y;
+    const d  = Math.hypot(dx, dy) || 0.001;
+
+    /* Separation */
+    if (d < SEP_RADIUS) {
+      sepX += dx/d * (SEP_RADIUS - d) / SEP_RADIUS;
+      sepY += dy/d * (SEP_RADIUS - d) / SEP_RADIUS;
+      sepN++;
+    }
+
+    /* Alignment + cohesion within flock radius */
+    if (d < FLOCK_R) {
+      aliX += o.vx; aliY += o.vy; aliN++;
+      cohX += o.x;  cohY += o.y;
+    }
+  }
+
+  /* Steer toward flock centroid */
+  if (aliN > 0) {
+    aliX /= aliN; aliY /= aliN;
+    cohX = cohX/aliN - f.x;
+    cohY = cohY/aliN - f.y;
+    const cd = Math.hypot(cohX, cohY) || 1;
+    cohX /= cd; cohY /= cd;
+  }
+
+  /* Flock-level wander direction */
+  const wx = myFlock ? Math.cos(myFlock.wander) : Math.cos(f.wander);
+  const wy = myFlock ? Math.sin(myFlock.wander) : Math.sin(f.wander);
+
+  /* Individual micro-wander */
   f.wander += f.wSpd;
-  f.vx += Math.cos(f.wander)*0.003;
-  f.vy += Math.sin(f.wander)*0.002;
+  const iwx = Math.cos(f.wander) * W_WANDER;
+  const iwy = Math.sin(f.wander) * W_WANDER;
 
-  const spd = Math.sqrt(f.vx*f.vx + f.vy*f.vy);
-  const tgt = 0.45;
-  if (spd > tgt*1.5) { f.vx*=tgt*1.5/spd; f.vy*=tgt*1.5/spd; }
-  if (spd < tgt*0.3) { f.vx*=tgt*0.3/spd; f.vy*=tgt*0.3/spd; }
+  f.vx += sepX * W_SEP + aliX * W_ALI + cohX * W_COH + wx * W_FLOCK + iwx;
+  f.vy += sepY * W_SEP + aliY * W_ALI + cohY * W_COH + wy * W_FLOCK + iwy;
 
-  const m = 160;
-  if (f.x < m)      f.vx += 0.03;
-  if (f.x > TW-m)   f.vx -= 0.03;
-  if (f.y < m)      f.vy += 0.022;
-  if (f.y > TH-m)   f.vy -= 0.022;
+  /* Speed clamp */
+  const spd = Math.hypot(f.vx, f.vy);
+  if (spd > SPEED_TGT*1.6) { f.vx *= SPEED_TGT*1.6/spd; f.vy *= SPEED_TGT*1.6/spd; }
+  if (spd < SPEED_TGT*0.3) { f.vx *= SPEED_TGT*0.3/spd; f.vy *= SPEED_TGT*0.3/spd; }
+
+  /* Boundary repulsion */
+  const m = 140;
+  if (f.x < m)       f.vx += 0.04;
+  if (f.x > TW - m)  f.vx -= 0.04;
+  if (f.y < m)       f.vy += 0.03;
+  if (f.y > TH - m)  f.vy -= 0.03;
 
   f.x += f.vx;
   f.y += f.vy;
 }
 
 /* ═══════════════════════════════════════
-   DEMO SPAWN — staggered
+   DEMO SPAWN — two starter flocks
 ═══════════════════════════════════════ */
-for (let i=0; i<8; i++) {
-  setTimeout(() => {
-    tankFish.push(spawnFish());
-    document.getElementById('fishCount').textContent = tankFish.length;
-  }, i*900 + 200);
-}
+(function seedFlocks() {
+  const startSize = 12;
+
+  // Flock 1 — left side
+  const fl1 = createFlock(TW*0.3, TH*0.5);
+  // Flock 2 — right side
+  const fl2 = createFlock(TW*0.7, TH*0.5);
+
+  for (let i=0; i<startSize; i++) {
+    const fl  = i < startSize/2 ? fl1 : fl2;
+    const cx  = fl === fl1 ? TW*0.3 : TW*0.7;
+    const cy  = TH*0.5;
+    setTimeout(() => {
+      const px = cx + (Math.random()-0.5)*180;
+      const py = cy + (Math.random()-0.5)*120;
+      spawnFish(null, fl, px, py);
+      document.getElementById('fishCount').textContent = tankFish.length;
+    }, i*200 + 100);
+  }
+})();
 
 /* ═══════════════════════════════════════
    MAIN LOOP
 ═══════════════════════════════════════ */
 function loop() {
-  ctx.clearRect(0,0,TW,TH);
+  ctx.clearRect(0, 0, TW, TH);
+
+  for (const fl of flocks) updateFlock(fl);
 
   for (const f of tankFish) {
     updateFish(f);
-
     const heading = Math.atan2(f.vy, f.vx);
-
     ctx.save();
     ctx.globalAlpha = f.opacity;
     ctx.translate(f.x, f.y);
@@ -388,18 +495,18 @@ loop();
 /* ═══════════════════════════════════════
    PUBLIC API
 ═══════════════════════════════════════ */
-function addFishToTank(seed) {
+function addFishToTank(seed, px, py) {
   const rng = mulberry32(seed != null ? seed : Math.floor(Math.random()*999999));
-  tankFish.push(spawnFish(generateFishDNA(rng)));
+  const dna = generateFishDNA(rng);
+  const x   = px != null ? px : TW*0.12 + Math.random()*TW*0.76;
+  const y   = py != null ? py : TH*0.12 + Math.random()*TH*0.76;
+  const f   = spawnFish(dna, null, x, y);
+  assignFlock(f, x, y);
   document.getElementById('fishCount').textContent = tankFish.length;
 }
 
 tankC.addEventListener('click', (e) => {
-  const f = spawnFish();
-  f.x = e.clientX;
-  f.y = e.clientY;
-  tankFish.push(f);
-  document.getElementById('fishCount').textContent = tankFish.length;
+  addFishToTank(null, e.clientX, e.clientY);
 });
 
 window.addEventListener('storage', (e) => {
