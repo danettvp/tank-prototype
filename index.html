@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Leak — The Tank</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;1,300&family=Inconsolata:wght@300;400&display=swap');
+
+:root {
+  --teal:   #00c8aa;
+  --ink:    #c8d4e8;
+  --muted:  rgba(180,200,230,0.28);
+  --bg:     #03060d;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  font-family: 'Inconsolata', monospace;
+  color: var(--ink);
+}
+
+#tank-bg {
+  position: fixed; inset: 0; z-index: 0;
+  background-image: url('bg.png');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+#tank-bg::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(
+    to bottom,
+    rgba(3,6,13,0.55) 0%,
+    rgba(3,6,13,0.3)  50%,
+    rgba(3,6,13,0.65) 100%
+  );
+}
+
+#networkCanvas { position: fixed; inset: 0; z-index: 1; opacity: 0.4; }
+#tankCanvas    { position: fixed; inset: 0; z-index: 2; }
+
+#ui {
+  position: fixed; inset: 0; z-index: 10;
+  pointer-events: none;
+  display: flex; flex-direction: column;
+  justify-content: space-between;
+  padding: 36px 44px;
+}
+.ui-top { display: flex; align-items: flex-start; justify-content: space-between; }
+.ui-wordmark { font-size: 9px; letter-spacing: 0.35em; text-transform: uppercase; color: var(--teal); opacity: 0.7; }
+.ui-count { text-align: right; }
+.ui-count-num { font-family: 'Cormorant', serif; font-weight: 300; font-size: 42px; line-height: 1; color: var(--ink); opacity: 0.6; }
+.ui-count-lbl { font-size: 8px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--muted); margin-top: 4px; }
+.ui-bottom { display: flex; align-items: flex-end; justify-content: space-between; }
+.ui-thesis { font-family: 'Cormorant', serif; font-style: italic; font-weight: 300; font-size: clamp(14px,1.8vw,18px); color: rgba(180,200,230,0.35); max-width: 380px; line-height: 1.7; }
+.ui-pulse { display: flex; align-items: center; gap: 8px; font-size: 8px; letter-spacing: 0.18em; text-transform: uppercase; color: rgba(0,200,170,0.35); }
+.pulse-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--teal); opacity: 0.5; animation: pulse 2.4s ease-in-out infinite; }
+@keyframes pulse {
+  0%,100% { opacity: 0.2; transform: scale(1); }
+  50%     { opacity: 0.7; transform: scale(1.3); }
+}
+</style>
+</head>
+<body>
+
+<div id="tank-bg"></div>
+<canvas id="networkCanvas"></canvas>
+<canvas id="tankCanvas"></canvas>
+
+<div id="ui">
+  <div class="ui-top">
+    <div class="ui-wordmark">Data Leak</div>
+    <div class="ui-count">
+      <div class="ui-count-num" id="fishCount">0</div>
+      <div class="ui-count-lbl">fish released</div>
+    </div>
+  </div>
+  <div class="ui-bottom">
+    <div class="ui-thesis">
+      Your data tells a story.<br>Make sure it's one you chose to tell.
+    </div>
+    <div class="ui-pulse"><div class="pulse-dot"></div>Live</div>
+  </div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════
+   NETWORK BACKGROUND
+═══════════════════════════════════════ */
+const netC = document.getElementById('networkCanvas');
+const netX = netC.getContext('2d');
+let NW, NH;
+const NP = [];
+
+function resizeNet() { NW = netC.width = window.innerWidth; NH = netC.height = window.innerHeight; }
+resizeNet();
+window.addEventListener('resize', resizeNet);
+
+for (let i = 0; i < 50; i++) NP.push({
+  x: Math.random(), y: Math.random(),
+  vx: (Math.random()-.5)*.00018, vy: (Math.random()-.5)*.00018,
+  r: Math.random()*1.1+.2, a: Math.random()*.25+.05, h: 165+Math.random()*30
+});
+
+function animNet() {
+  netX.clearRect(0,0,NW,NH);
+  for (let i=0;i<NP.length;i++) {
+    const p=NP[i];
+    p.x=(p.x+p.vx+1)%1; p.y=(p.y+p.vy+1)%1;
+    netX.beginPath(); netX.arc(p.x*NW,p.y*NH,p.r,0,Math.PI*2);
+    netX.fillStyle=`hsla(${p.h},70%,55%,${p.a})`; netX.fill();
+    for(let j=i+1;j<NP.length;j++){
+      const q=NP[j];
+      const dx=(p.x-q.x)*NW, dy=(p.y-q.y)*NH;
+      const d=Math.sqrt(dx*dx+dy*dy);
+      if(d<110){
+        netX.beginPath();
+        netX.moveTo(p.x*NW,p.y*NH); netX.lineTo(q.x*NW,q.y*NH);
+        netX.strokeStyle=`rgba(0,200,170,${.04*(1-d/110)})`;
+        netX.lineWidth=.4; netX.stroke();
+      }
+    }
+  }
+  requestAnimationFrame(animNet);
+}
+animNet();
+
+/* ═══════════════════════════════════════
+   FIBRE FISH ENGINE
+═══════════════════════════════════════ */
+const tankC = document.getElementById('tankCanvas');
+const ctx   = tankC.getContext('2d');
+let TW, TH;
+
+function resizeTank() { TW = tankC.width = window.innerWidth; TH = tankC.height = window.innerHeight; }
+resizeTank();
+window.addEventListener('resize', resizeTank);
+
+/* ── Seeded RNG ── */
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ── DNA ── */
+function generateFishDNA(rng) {
+  const h1 = rng() * 360;
+  const h2 = (h1 + 80 + rng() * 140) % 360;
+  const h3 = (h2 + 80 + rng() * 140) % 360;
+
+  const shapeRoll = rng();
+  const shape = shapeRoll < 0.25 ? 'slim' : shapeRoll < 0.5 ? 'chubby' : shapeRoll < 0.75 ? 'deep' : 'round';
+  const shapeParams = {
+    slim:   { dorsalHeight: 55,  bellyDepth: 50,  bodyLength: 420, roundness: 0.85 },
+    chubby: { dorsalHeight: 100, bellyDepth: 95,  bodyLength: 340, roundness: 1.1  },
+    deep:   { dorsalHeight: 110, bellyDepth: 65,  bodyLength: 360, roundness: 0.95 },
+    round:  { dorsalHeight: 105, bellyDepth: 100, bodyLength: 310, roundness: 1.2  },
+  }[shape];
+
+  const tailRoll = rng();
+  const tail = tailRoll < 0.33 ? 'forked' : tailRoll < 0.66 ? 'fan' : 'wispy';
+  const tailParams = {
+    forked: { tailAngle: 0.55, tailLength: 88,  tailSpread: 1.0 },
+    fan:    { tailAngle: 0.28, tailLength: 55,  tailSpread: 2.0 },
+    wispy:  { tailAngle: 0.70, tailLength: 115, tailSpread: 0.75 },
+  }[tail];
+
+  const lineRoll = rng();
+  const lineStyle = lineRoll < 0.33 ? 'sparse' : lineRoll < 0.66 ? 'medium' : 'dense';
+  const lineParams = {
+    sparse: { N: 10 + Math.floor(rng()*5),  centreWidth: 7 + rng()*5,   edgeWidth: 2.0 + rng()*2   },
+    medium: { N: 18 + Math.floor(rng()*10), centreWidth: 4 + rng()*3.5, edgeWidth: 1.0 + rng()*1.5 },
+    dense:  { N: 38 + Math.floor(rng()*18), centreWidth: 2 + rng()*2,   edgeWidth: 0.4 + rng()*0.7 },
+  }[lineStyle];
+
+  const flowRoll = rng();
+  const flow = flowRoll < 0.33 ? 'calm' : flowRoll < 0.66 ? 'wavy' : 'wild';
+  const flowParams = {
+    calm: { driftAmp: 1 + rng()*2,  driftSpeed: 0.2 + rng()*0.2 },
+    wavy: { driftAmp: 4 + rng()*5,  driftSpeed: 0.4 + rng()*0.3 },
+    wild: { driftAmp: 10 + rng()*8, driftSpeed: 0.7 + rng()*0.5 },
+  }[flow];
+
+  const hasDorsal  = rng() > 0.45;
+  const dorsalPos  = 0.45 + rng() * 0.25;
+  const dorsalSize = 20   + rng() * 40;
+
+  return {
+    ...shapeParams, ...tailParams, ...lineParams, ...flowParams,
+    shimmerSpeed: 1.2 + rng() * 2.0,
+    h1, h2, h3,
+    sat: 65 + rng() * 35,
+    brightCentre: 80 + rng() * 20,
+    brightEdge:   38 + rng() * 30,
+    hasDorsal, dorsalPos, dorsalSize,
+  };
+}
+
+/* ── Tri-hue colour lerp ── */
+function triHue(t, h1, h2, h3) {
+  if (t < 0.5) {
+    const f = t / 0.5;
+    let d = ((h2-h1)+360)%360; if(d>180) d-=360;
+    return (h1 + d*f + 360) % 360;
+  }
+  const f = (t-0.5)/0.5;
+  let d = ((h3-h2)+360)%360; if(d>180) d-=360;
+  return (h2 + d*f + 360) % 360;
+}
+
+/* ── Body cross-section ── */
+function bodySlice(u, dna) {
+  const r = dna.roundness;
+  const dorsalEnv = Math.pow(Math.sin(Math.pow(Math.max(0,Math.min(1,u*1.05)),0.5)*Math.PI), 0.6/r);
+  const bellyEnv  = Math.pow(Math.sin(Math.pow(Math.max(0,Math.min(1,u*0.98)),0.45)*Math.PI), 0.55/r);
+  let bump = 0;
+  if (dna.hasDorsal) {
+    const d = u - dna.dorsalPos;
+    bump = dna.dorsalSize * Math.exp(-d*d*120) * Math.min(1,u*8) * Math.min(1,(1-u)*8);
+  }
+  return { topY: -dorsalEnv*dna.dorsalHeight - bump, botY: bellyEnv*dna.bellyDepth };
+}
+
+/* ── Draw fibre fish. ctx must already be translated/rotated/scaled. ── */
+function drawFibreFish(dna, t) {
+  const N = dna.N;
+  const halfLen    = dna.bodyLength / 2;
+  const noseX      =  halfLen;
+  const tailRootX  = -halfLen;
+
+  for (let i = 0; i < N; i++) {
+    const f       = i / (N-1);
+    const centreF = 1 - Math.abs(f-0.5)*2;
+    const side    = f < 0.5 ? 1 : -1;
+    const frac    = f < 0.5 ? (0.5-f)*2 : (f-0.5)*2;
+
+    /* Tail fork */
+    const ta   = side > 0 ? -dna.tailAngle : dna.tailAngle;
+    const tlen = dna.tailLength * dna.tailSpread * frac;
+    const pts  = [
+      { x: tailRootX - Math.cos(ta)*tlen, y: side*frac*10 + side*Math.sin(Math.abs(ta))*tlen },
+      { x: tailRootX-4, y: side*frac*11 },
+    ];
+
+    /* Body */
+    for (let s=1; s<=20; s++) {
+      const u = s/20;
+      const x = tailRootX + u*dna.bodyLength;
+      const { topY, botY } = bodySlice(u, dna);
+      const pinnedF = 0.5 + (f-0.5)*(1-Math.pow(u,3.5))*(1-Math.pow(1-u,2)*0.45);
+      const y = topY + (botY-topY)*pinnedF;
+      const drift = Math.sin(t*dna.driftSpeed + f*Math.PI*5 + u*4)*dna.driftAmp*Math.sin(u*Math.PI)*frac;
+      pts.push({ x, y: y+drift });
+    }
+    pts.push({ x: noseX, y: 0 });
+
+    const shimmer = 0.5 + 0.5*Math.sin(t*dna.shimmerSpeed + f*Math.PI*7);
+    const alpha   = Math.min(0.20 + centreF*0.50 + shimmer*0.07, 0.98);
+    const lw      = dna.edgeWidth + centreF*(dna.centreWidth-dna.edgeWidth);
+
+    /* Path builder */
+    const buildPath = () => {
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let k=1; k<pts.length-1; k++) {
+        ctx.quadraticCurveTo(pts[k].x, pts[k].y, (pts[k].x+pts[k+1].x)/2, (pts[k].y+pts[k+1].y)/2);
+      }
+      ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y);
+    };
+
+    /* Gradient */
+    const grd = ctx.createLinearGradient(pts[0].x, pts[0].y, noseX, 0);
+    for (let g=0; g<=6; g++) {
+      const gt = g/6;
+      const h  = (triHue(gt, dna.h1, dna.h2, dna.h3) + (f-0.5)*45 + 360) % 360;
+      const l  = dna.brightEdge + centreF*(dna.brightCentre-dna.brightEdge);
+      const tf = gt>0.88 ? (1-(gt-0.88)/0.12) : 1;
+      grd.addColorStop(gt, `hsla(${h},${dna.sat}%,${l}%,${alpha*tf})`);
+    }
+
+    buildPath();
+    ctx.strokeStyle = grd;
+    ctx.lineWidth   = lw;
+    ctx.lineCap     = 'round';
+    ctx.stroke();
+  }
+}
+
+/* ═══════════════════════════════════════
+   FISH INSTANCES
+═══════════════════════════════════════ */
+const tankFish = [];
+
+function spawnFish(dnaOverride) {
+  const seed = Math.floor(Math.random()*999999);
+  const rng  = mulberry32(seed);
+  const dna  = dnaOverride || generateFishDNA(rng);
+
+  /* Scale so the fish appears ~200-280px wide on screen */
+  const targetW = 200 + Math.random()*80;
+  const scale   = targetW / dna.bodyLength;
+
+  /* Start inside the screen */
+  const x = TW*0.12 + Math.random()*TW*0.76;
+  const y = TH*0.12 + Math.random()*TH*0.76;
+  const a = Math.random()*Math.PI*2;
+  const spd = 0.35 + Math.random()*0.4;
+
+  return {
+    x, y,
+    vx: Math.cos(a)*spd,
+    vy: Math.sin(a)*spd,
+    dna, scale,
+    t:       Math.random()*100,
+    wander:  Math.random()*Math.PI*2,
+    wSpd:    (Math.random()-0.5)*0.011,
+    opacity: 0,
+  };
+}
+
+function updateFish(f) {
+  f.t += 0.015;
+  if (f.opacity < 1) f.opacity = Math.min(1, f.opacity+0.006);
+
+  f.wander += f.wSpd;
+  f.vx += Math.cos(f.wander)*0.003;
+  f.vy += Math.sin(f.wander)*0.002;
+
+  const spd = Math.sqrt(f.vx*f.vx + f.vy*f.vy);
+  const tgt = 0.45;
+  if (spd > tgt*1.5) { f.vx*=tgt*1.5/spd; f.vy*=tgt*1.5/spd; }
+  if (spd < tgt*0.3) { f.vx*=tgt*0.3/spd; f.vy*=tgt*0.3/spd; }
+
+  const m = 160;
+  if (f.x < m)      f.vx += 0.03;
+  if (f.x > TW-m)   f.vx -= 0.03;
+  if (f.y < m)      f.vy += 0.022;
+  if (f.y > TH-m)   f.vy -= 0.022;
+
+  f.x += f.vx;
+  f.y += f.vy;
+}
+
+/* ═══════════════════════════════════════
+   DEMO SPAWN — staggered
+═══════════════════════════════════════ */
+for (let i=0; i<8; i++) {
+  setTimeout(() => {
+    tankFish.push(spawnFish());
+    document.getElementById('fishCount').textContent = tankFish.length;
+  }, i*900 + 200);
+}
+
+/* ═══════════════════════════════════════
+   MAIN LOOP
+═══════════════════════════════════════ */
+function loop() {
+  ctx.clearRect(0,0,TW,TH);
+
+  for (const f of tankFish) {
+    updateFish(f);
+
+    const heading = Math.atan2(f.vy, f.vx);
+
+    ctx.save();
+    ctx.globalAlpha = f.opacity;
+    ctx.translate(f.x, f.y);
+    ctx.rotate(heading);
+    ctx.scale(f.scale, f.scale);
+    drawFibreFish(f.dna, f.t);
+    ctx.restore();
+  }
+
+  requestAnimationFrame(loop);
+}
+loop();
+
+/* ═══════════════════════════════════════
+   PUBLIC API
+═══════════════════════════════════════ */
+function addFishToTank(seed) {
+  const rng = mulberry32(seed != null ? seed : Math.floor(Math.random()*999999));
+  tankFish.push(spawnFish(generateFishDNA(rng)));
+  document.getElementById('fishCount').textContent = tankFish.length;
+}
+
+window.addEventListener('storage', (e) => {
+  if (e.key === 'datafish-release') {
+    try { const { seed } = JSON.parse(e.newValue); addFishToTank(seed); } catch(_) {}
+  }
+});
+</script>
+</body>
+</html>
