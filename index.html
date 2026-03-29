@@ -306,8 +306,8 @@ function spawnFish(dnaOverride) {
   const rng  = mulberry32(seed);
   const dna  = dnaOverride || generateFishDNA(rng);
 
-  /* Scale so the fish appears ~200-280px wide on screen */
-  const targetW = 200 + Math.random()*80;
+  /* Scale so the fish appears ~80-130px wide on screen */
+  const targetW = 80 + Math.random()*50;
   const scale   = targetW / dna.bodyLength;
 
   /* Start inside the screen */
@@ -393,6 +393,14 @@ function addFishToTank(seed) {
   tankFish.push(spawnFish(generateFishDNA(rng)));
   document.getElementById('fishCount').textContent = tankFish.length;
 }
+
+tankC.addEventListener('click', (e) => {
+  const f = spawnFish();
+  f.x = e.clientX;
+  f.y = e.clientY;
+  tankFish.push(f);
+  document.getElementById('fishCount').textContent = tankFish.length;
+});
 
 window.addEventListener('storage', (e) => {
   if (e.key === 'datafish-release') {
